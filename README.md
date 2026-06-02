@@ -12,6 +12,13 @@ Shoutouts:
 
 ---
 
+> **Note for cloned installations:** The following large files are **not included** in this repository and must be obtained separately before use:
+> - **VGGT model files** (`model.pt`, `nonCom_model.pt`) — download from the [VGGT GitHub repo](https://github.com/facebookresearch/vggt) and place in a `models/` folder at the root of your SplatPipe installation
+> - **Sky segmentation model** (`skyseg.onnx`) — downloaded automatically on first use when sky filtering is enabled; no manual step required
+> - **FFmpeg** (`ffmpeg.exe`, `ffprobe.exe`) — download from [ffmpeg.org](https://ffmpeg.org/download.html) and place the executables in the `FFmpeg and RS Settings/` folder, then configure the path in the Configuration tab
+
+---
+
 A complete pipeline for converting 360° videos and equirectangular images into 3D Gaussian Splats for neural rendering and immersive experiences.
 
 ## 🚀 What's New
@@ -65,7 +72,7 @@ A complete pipeline for converting 360° videos and equirectangular images into 
 - Ensure both VGGT installation and model configuration are complete before using Skip RealityScan + VGGT mode
 
 **Required External Tools:**
-- **FFmpeg** (included in project)
+- **FFmpeg** - [Download](https://ffmpeg.org/download.html) — place `ffmpeg.exe` and `ffprobe.exe` in the `FFmpeg and RS Settings/` folder
 - **RealityScan** - [Download](https://www.realityscan.com/en-US/download)
 - **VGGT** - AI-powered camera alignment - [Download and Installation Instructions](https://github.com/facebookresearch/vggt)
 - **Postshot** - [Download](https://www.jawset.com/)

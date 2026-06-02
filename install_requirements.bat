@@ -91,13 +91,22 @@ echo =======================================================================
 echo.
 echo [COMPLETE] Installation finished!
 echo.
-echo [NEXT] Configure tool paths in 360° SplatPipe (Configuration tab):
-echo   - RealityScan executable
-echo   - Postshot executable  
-echo   - Brush executable
-echo   - FFmpeg path (if not using bundled version)
+echo [NEXT] Before launching, ensure these files are in place:
 echo.
-echo 
+echo   1. FFmpeg ^(not included^):
+echo      - Download from https://ffmpeg.org/download.html
+echo      - Place ffmpeg.exe and ffprobe.exe in "FFmpeg and RS Settings\" folder
+echo.
+echo   2. VGGT Model ^(not included^):
+echo      - Download from https://github.com/facebookresearch/vggt
+echo      - Accepts Meta license agreement required
+echo      - Place model file^(s^) in "models\" folder
+echo      - skyseg.onnx will be downloaded automatically on first use
+echo.
+echo   3. Configure tool paths in the Configuration tab:
+echo      - FFmpeg path
+echo      - VGGT installation path + model path
+echo      - RealityScan, Postshot, Brush executables
 echo.
 echo =======================================================================
 

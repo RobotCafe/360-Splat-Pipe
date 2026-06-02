@@ -1,0 +1,32 @@
+# 360° SplatPipe - Full Dependencies
+# For GPU acceleration: Install CUDA Toolkit 12.x first, then run install_requirements.bat
+
+# === CORE DEPENDENCIES (Required for app startup) ===
+numpy>=1.21.0
+Pillow>=8.0.0
+psutil>=5.8.0
+py360convert>=0.1.0
+GPUtil>=1.4.0
+
+# === HEAVY DEPENDENCIES (Downloaded on first use) ===
+# Image/Video Processing
+opencv-python>=4.5.0
+
+# Scientific Computing
+scipy>=1.7.0
+matplotlib>=3.5.0
+
+# GPU acceleration (requires CUDA 12.x)
+cupy-cuda12x
+
+# VGGT dependencies
+pycolmap>=0.4.0
+trimesh>=3.9.0
+
+# Additional dependencies for advanced features
+requests>=2.25.0
+onnxruntime>=1.10.0
+
+# Note: Packaged app starts with core dependencies only
+# Heavy dependencies are installed via first-run setup wizard
+# App automatically falls back to CPU mode if GPU dependencies unavailable

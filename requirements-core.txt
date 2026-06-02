@@ -1,0 +1,16 @@
+# 360° SplatPipe - Core Dependencies (Lightweight)
+# These are essential dependencies for app startup and basic functionality
+
+# Core GUI and utilities
+numpy>=1.21.0
+Pillow>=8.0.0
+psutil>=5.8.0
+
+# Essential for 360° processing
+py360convert>=0.1.0
+
+# Basic system monitoring  
+GPUtil>=1.4.0
+
+# Note: Heavy dependencies (OpenCV, SciPy, Matplotlib, CuPy, etc.) 
+# are downloaded on first use via the app's setup wizard

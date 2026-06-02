@@ -1,0 +1,47 @@
+# Build outputs
+build/
+dist/
+*.spec
+
+# Large model files
+models/
+*.pt
+*.pth
+*.onnx
+
+# Logs and runtime data
+logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+.eggs/
+venv/
+env/
+.venv/
+.env
+
+# PyInstaller
+*.manifest
+
+# Executables
+*.exe
+*.dll
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# Config with local overrides (keep the template, ignore personal settings)
+# 360_SplatPipe_config.ini is intentionally tracked

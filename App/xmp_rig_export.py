@@ -35,10 +35,29 @@ def focal_length_35mm_from_fov(fov_deg: float) -> float:
     return 18.0 / np.tan(np.radians(fov_deg / 2.0))
 
 
-def generate_xmp_content(focal_length_35mm: float) -> str:
-    """Generate XMP content: intrinsic calibration only, no pose/rig fields.
-    Matches Epic's own pano2views tool's XMP format for 360-camera virtual
-    cameras."""
+def generate_xmp_content(focal_length_35mm: float,
+                         gps: dict | None = None) -> str:
+    """Generate XMP content: intrinsic calibration only (no pose/rig fields),
+    matching Epic's own pano2views tool's XMP format.  If `gps` is provided
+    (dict with 'lat', 'lon', optional 'alt'), adds a GPS position prior so
+    RealityScan can use approximate camera positions to seed alignment.
+
+    Note: RealityCapture's xcr:Coordinates="absolute" position order is
+    longitude, latitude, altitude (NOT lat/lon).  PosePrior is "draft" (not
+    "exact") because GPS has ~3–10 m accuracy — RS refines poses via feature
+    matching, using GPS only as an initial constraint."""
+    gps_attrs = ""
+    gps_pos   = ""
+    if gps and gps.get('lat') is not None and gps.get('lon') is not None:
+        lat = float(gps['lat'])
+        lon = float(gps['lon'])
+        alt = float(gps.get('alt', 0))
+        gps_attrs = (
+            '\n   xcr:Coordinates="absolute"'
+            '\n   xcr:PosePrior="draft"'
+        )
+        gps_pos = f"\n   <xcr:Position>{lon:.8f} {lat:.8f} {alt:.3f}</xcr:Position>"
+
     xmp_template = f'''<x:xmpmeta xmlns:x="adobe:ns:meta/">
  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
   <rdf:Description xmlns:xcr="http://www.capturingreality.com/ns/xcr/1.1#"
@@ -52,7 +71,7 @@ def generate_xmp_content(focal_length_35mm: float) -> str:
    xcr:PrincipalPointV="0"
    xcr:CalibrationPrior="exact"
    xcr:CalibrationGroup="-1"
-   xcr:DistortionGroup="-1">
+   xcr:DistortionGroup="-1"{gps_attrs}>{gps_pos}
   </rdf:Description>
  </rdf:RDF>
 </x:xmpmeta>'''
@@ -60,7 +79,8 @@ def generate_xmp_content(focal_length_35mm: float) -> str:
 
 
 def export_xmp_rig_files(output_dir: str, frame_name: str, pitch_angles: list, yaw_steps: int,
-                         fov_deg: float, horizon_ref: bool = False, **_ignored):
+                         fov_deg: float, horizon_ref: bool = False,
+                         gps: dict | None = None, **_ignored):
     """
     Export XMP calibration sidecars for a single frame's extracted views.
 
@@ -81,7 +101,7 @@ def export_xmp_rig_files(output_dir: str, frame_name: str, pitch_angles: list, y
     """
     output_path = Path(output_dir)
     focal_length_35mm = focal_length_35mm_from_fov(fov_deg)
-    xmp_content = generate_xmp_content(focal_length_35mm)
+    xmp_content = generate_xmp_content(focal_length_35mm, gps=gps)
 
     # Build view metadata list to match panorama_processing.py naming exactly
     view_meta = []  # (view_index, pitch_deg, yaw_idx)
@@ -106,18 +126,27 @@ def export_xmp_rig_files(output_dir: str, frame_name: str, pitch_angles: list, y
 
 
 def export_all_frame_rigs(views_dir: str, pitch_angles: list, yaw_steps: int, fov_deg: float,
-                          horizon_ref: bool = False):
+                          horizon_ref: bool = False,
+                          gps_map: "dict[str, dict] | None" = None,
+                          gps_sidecar_dir: str | None = None):
     """
     Export XMP calibration sidecars for all frames in the views directory.
 
     Args:
-        views_dir:    Root directory containing frame subdirectories
-        pitch_angles: List of pitch angles used for extraction
-        yaw_steps:    Number of yaw steps used for extraction
-        fov_deg:      The FOV the views were actually rendered at -- must match the
-                      fov_deg passed to panorama_processing.render_views() for this job.
-        horizon_ref:  If True, include the view_00 horizon reference sensor in each frame's XMP set
+        views_dir:         Root directory containing frame subdirectories (02_views/)
+        pitch_angles:      List of pitch angles used for extraction
+        yaw_steps:         Number of yaw steps used for extraction
+        fov_deg:           The FOV the views were actually rendered at
+        horizon_ref:       If True, include the view_00 horizon reference sensor
+        gps_map:           Optional {frame_stem: {lat, lon, alt}} dict. When provided,
+                           GPS position priors are written into each frame's XMP files.
+        gps_sidecar_dir:   If gps_map is None, look for <frame_stem>.gps.json files in
+                           this directory (typically the input "import from camera" dir).
+                           This is the automatic path: GPS written during camera import
+                           is picked up here without needing extra parameters.
     """
+    import json as _json
+
     views_path = Path(views_dir)
 
     if not views_path.exists():
@@ -130,16 +159,45 @@ def export_all_frame_rigs(views_dir: str, pitch_angles: list, yaw_steps: int, fo
         print(f"No frame directories found in: {views_dir}")
         return False
 
+    # Auto-discover GPS sidecar dir if not given (sibling of 02_views/)
+    sidecar_path = None
+    if gps_map is None and gps_sidecar_dir is None:
+        # Try <views_dir>/../import from camera/  then  <views_dir>/../imported photos/
+        parent = views_path.parent
+        for candidate in ("import from camera", "imported photos"):
+            p = parent / candidate
+            if p.is_dir():
+                sidecar_path = p
+                break
+    elif gps_sidecar_dir:
+        sidecar_path = Path(gps_sidecar_dir)
+
+    gps_count = 0
     print(f"Exporting XMP calibration sidecars for {len(frame_dirs)} frames...")
 
     success_count = 0
     for frame_dir in frame_dirs:
+        stem = frame_dir.name
+        # Resolve GPS for this frame
+        gps = None
+        if gps_map:
+            gps = gps_map.get(stem)
+        elif sidecar_path:
+            sidecar = sidecar_path / f"{stem}.gps.json"
+            if sidecar.exists():
+                try:
+                    gps = _json.loads(sidecar.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+        if gps:
+            gps_count += 1
         try:
-            export_xmp_rig_files(str(frame_dir), frame_dir.name, pitch_angles, yaw_steps,
-                                 fov_deg=fov_deg, horizon_ref=horizon_ref)
+            export_xmp_rig_files(str(frame_dir), stem, pitch_angles, yaw_steps,
+                                 fov_deg=fov_deg, horizon_ref=horizon_ref, gps=gps)
             success_count += 1
         except Exception as e:
-            print(f"Failed to export XMP for {frame_dir.name}: {e}")
+            print(f"Failed to export XMP for {stem}: {e}")
 
-    print(f"XMP export complete: {success_count}/{len(frame_dirs)} frames processed")
+    gps_note = f" ({gps_count} with GPS position priors)" if gps_count else ""
+    print(f"XMP export complete: {success_count}/{len(frame_dirs)} frames processed{gps_note}")
     return success_count > 0

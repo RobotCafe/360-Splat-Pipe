@@ -23,10 +23,18 @@ def create_virtual_camera(pano_height, fov_deg):
     return image_size, focal
 
 # --- Generate rays in camera space ---
-def get_virtual_camera_rays(image_size):
+def get_virtual_camera_rays(image_size, focal):
+    # Pixel -> normalized local ray via the actual pinhole focal length, so the
+    # rendered content's real angular extent matches fov_deg (and therefore the
+    # focal length create_virtual_camera() tells COLMAP). Previously this divided
+    # by image_size instead of focal, which implies a fixed focal of image_size/2
+    # (exactly 90 deg FOV) regardless of the requested fov_deg -- a mismatch
+    # between what was rendered and what downstream consumers were told, e.g. a
+    # 7.7% systematic focal error at fov_deg=94.6 (the default). See
+    # FieldRaven_desktop/RIG_PIPELINE_PROCESS.md, "Open issue" section.
     y, x = NP.indices((image_size, image_size)).astype(NP.float32)
     xy = NP.stack([(x + 0.5), (image_size - y - 0.5)], axis=-1)
-    xy = (xy - image_size / 2) / image_size * 2
+    xy = (xy - image_size / 2) / focal
     rays = NP.concatenate([xy, NP.ones((*xy.shape[:2], 1), dtype=NP.float32)], axis=-1)
     rays /= NP.linalg.norm(rays, axis=-1, keepdims=True)
     return rays.reshape(-1, 3)
@@ -41,7 +49,7 @@ def spherical_uv_from_rays(rays):
     return NP.stack([u, v], axis=-1)
 
 # --- Generate rotations ---
-def get_virtual_rotations(yaw_steps, pitch_angles):
+def get_virtual_rotations(yaw_steps, pitch_angles, horizon_ref=False):
     def look_at_rotation(yaw_deg, pitch_deg):
         yaw = NP.radians(yaw_deg)
         pitch = NP.radians(pitch_deg)
@@ -61,6 +69,8 @@ def get_virtual_rotations(yaw_steps, pitch_angles):
         return R
 
     rotations = []
+    if horizon_ref:
+        rotations.append(look_at_rotation(0.0, 0.0))  # view_00: horizon reference sensor
     yaws = NP.linspace(0, 360, yaw_steps, endpoint=False)
     for pitch in pitch_angles:
         yaw_offset = (360 / yaw_steps / 2) if pitch > 0 else 0
@@ -99,8 +109,8 @@ def sample_equirectangular(pano_array, uv_coords):
     return color.astype(NP.uint8)
 
 # --- Enhanced render perspective views with validation and progress ---
-def render_views(pano_path, out_root, fov_deg, yaw_steps, pitch_angles, export_xmp, 
-                save_images, cancel_event, progress_callback=None):
+def render_views(pano_path, out_root, fov_deg, yaw_steps, pitch_angles, export_xmp,
+                save_images, cancel_event, progress_callback=None, horizon_ref=False):
     """
     Enhanced view rendering with file validation and progress callbacks.
     """
@@ -139,8 +149,8 @@ def render_views(pano_path, out_root, fov_deg, yaw_steps, pitch_angles, export_x
         pano_array = NP.asarray(pano_np_cpu) if GPU_ENABLED else pano_np_cpu
         
         image_size, focal = create_virtual_camera(h, fov_deg)
-        rays_array = get_virtual_camera_rays(image_size)
-        rotations = get_virtual_rotations(yaw_steps, pitch_angles)
+        rays_array = get_virtual_camera_rays(image_size, focal)
+        rotations = get_virtual_rotations(yaw_steps, pitch_angles, horizon_ref=horizon_ref)
 
         base_name = os.path.splitext(os.path.basename(pano_path))[0]
         out_dir = os.path.join(out_root, base_name)
@@ -175,9 +185,13 @@ def render_views(pano_path, out_root, fov_deg, yaw_steps, pitch_angles, export_x
             rendered_img = rendered_img_cpu.reshape(image_size, image_size, 3)
             img_pil = Image.fromarray(rendered_img)
             
-            current_pitch = pitch_angles[i // yaw_steps] 
-            yaw_idx = i % yaw_steps
-            filename = f"{base_name}_view_{i:02d}_p{current_pitch:+03.0f}_y{yaw_idx:02d}"
+            if horizon_ref and i == 0:
+                view_pitch, yaw_idx = 0.0, 0
+            else:
+                adj = i - (1 if horizon_ref else 0)
+                view_pitch = pitch_angles[adj // yaw_steps]
+                yaw_idx = adj % yaw_steps
+            filename = f"{base_name}_view_{i:02d}_p{view_pitch:+03.0f}_y{yaw_idx:02d}"
             
             if save_images: 
                 img_path = os.path.join(out_dir, f"{filename}.jpg")

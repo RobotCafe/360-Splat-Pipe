@@ -2143,8 +2143,9 @@ def run_full_pipeline(
     if progress_callback: progress_callback("🚀 Starting VGGT 3D Gaussian Splatting Pipeline...")
     
     processor = VGGTProcessor()
-    if not processor.initialize(progress_callback):
-        return {"success": False, "error": "VGGT initialization failed."}
+    init_ok, init_msg = processor.initialize(progress_callback)
+    if not init_ok:
+        return {"success": False, "error": f"VGGT initialization failed: {init_msg}"}
 
     try:
         os.makedirs(output_dir, exist_ok=True)

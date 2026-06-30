@@ -1,41 +1,48 @@
-# xmp_rig_export.py - RealityScan XMP rig file generation
+# xmp_rig_export.py - RealityScan XMP calibration sidecar generation
+#
+# Simplified to match Epic's own pano2views tool
+# (https://github.com/EpicGames/RealityScan) rather than our earlier
+# full pose/rig XMP. That tool writes ONLY intrinsic calibration
+# (CalibrationPrior="exact" + focal length derived from FOV) and deliberately
+# omits pose/position/rig fields, letting RealityScan's own SfM recover
+# camera poses and rig structure freely.
+#
+# Why: RealityCapture/RealityScan detects zero-baseline (zero-parallax)
+# sibling views from the same panorama automatically via feature matching --
+# it doesn't need to be told the rig structure the way COLMAP does. Writing
+# xcr:PosePrior="exact" with an absolute world position of (0,0,0) for every
+# camera (our old approach) is actively wrong: it tells RS every camera in
+# the whole sequence sits at the same world-space point, which is impossible
+# for a moving capture. The only prior RS genuinely needs from a virtual
+# 360-camera rig is the focal length, since that's the one thing it cannot
+# recover from feature matching alone.
 
-# Standard library imports
 import os
 import uuid
 from pathlib import Path
 
-# Third-party imports
 import numpy as np
 
-# Remove: from scipy.spatial.transform import Rotation (unused)
+
+def focal_length_35mm_from_fov(fov_deg: float) -> float:
+    """35mm-equivalent focal length for a given horizontal FOV (36mm sensor width
+    assumed, the standard "35mm equivalent" reference). Must track the actual
+    rendered FOV -- panorama_processing.py's get_virtual_camera_rays() renders
+    pixels at the real fov_deg, so RealityScan must be told the matching focal
+    length or its reconstruction has the same focal/frustum mismatch that caused
+    the wall/surface "double vision" bug in the COLMAP path (see
+    COLMAP_POSE_CORRECTION_BRIEF.md Problem 15)."""
+    return 18.0 / np.tan(np.radians(fov_deg / 2.0))
 
 
-def generate_xmp_content(
-    position: np.ndarray,
-    rotation_matrix: np.ndarray,
-    rig_id: str,
-    rig_instance_id: str,
-    rig_pose_index: int,
-    focal_length_35mm: float = 18.0,
-    pose_prior: str = "exact"  # "initial", "draft", "exact"
-) -> str:
-    """Generate XMP content for RealityScan rig configuration."""
-    
-    # Convert rotation matrix to RealityScan format (row-major 3x3 flattened)
-    rotation_flat = rotation_matrix.flatten()
-    rotation_str = " ".join(f"{r:.10f}" for r in rotation_flat)
-    
-    # Position as space-separated string
-    position_str = " ".join(f"{p:.12f}" for p in position)
-    
+def generate_xmp_content(focal_length_35mm: float) -> str:
+    """Generate XMP content: intrinsic calibration only, no pose/rig fields.
+    Matches Epic's own pano2views tool's XMP format for 360-camera virtual
+    cameras."""
     xmp_template = f'''<x:xmpmeta xmlns:x="adobe:ns:meta/">
  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
   <rdf:Description xmlns:xcr="http://www.capturingreality.com/ns/xcr/1.1#"
    xcr:Version="3"
-   xcr:PosePrior="{pose_prior}"
-   xcr:Rotation="{rotation_str}"
-   xcr:Coordinates="absolute"
    xcr:DistortionModel="division"
    xcr:DistortionCoeficients="0 0 0 0 0 0"
    xcr:FocalLength35mm="{focal_length_35mm}"
@@ -43,151 +50,96 @@ def generate_xmp_content(
    xcr:AspectRatio="1"
    xcr:PrincipalPointU="0"
    xcr:PrincipalPointV="0"
-   xcr:CalibrationPrior="initial"
+   xcr:CalibrationPrior="exact"
    xcr:CalibrationGroup="-1"
-   xcr:DistortionGroup="-1"
-   xcr:Rig="{{{rig_id}}}"
-   xcr:RigInstance="{{{rig_instance_id}}}"
-   xcr:RigPoseIndex="{rig_pose_index}"
-   xcr:InTexturing="1"
-   xcr:InMeshing="1">
-   <xcr:Position>{position_str}</xcr:Position>
+   xcr:DistortionGroup="-1">
   </rdf:Description>
  </rdf:RDF>
 </x:xmpmeta>'''
-    
     return xmp_template
 
 
-def create_rig_rotation_matrices(yaw_steps: int, pitch_angles: list):
+def export_xmp_rig_files(output_dir: str, frame_name: str, pitch_angles: list, yaw_steps: int,
+                         fov_deg: float, horizon_ref: bool = False, **_ignored):
     """
-    Create rotation matrices for virtual cameras matching your panorama_processing logic.
-    This should match the rotation logic in panorama_processing.py
-    """
-    rotations = []
-    
-    for pitch in pitch_angles:
-        # Calculate yaw offset (matches your existing logic)
-        yaw_offset = (360 / yaw_steps / 2) if pitch > 0 else 0
-        yaws = np.linspace(0, 360, yaw_steps, endpoint=False) + yaw_offset
-        
-        for yaw in yaws:
-            # Create look-at rotation matrix (matching your panorama_processing.py)
-            yaw_rad = np.radians(yaw)
-            pitch_rad = np.radians(pitch)
-            
-            # Direction vector
-            direction = np.array([
-                np.sin(yaw_rad) * np.cos(pitch_rad),
-                np.sin(pitch_rad),
-                np.cos(yaw_rad) * np.cos(pitch_rad)
-            ])
-            direction = direction / np.linalg.norm(direction)
+    Export XMP calibration sidecars for a single frame's extracted views.
 
-            # Create orthonormal basis
-            up = np.array([0, 1, 0])
-            right = np.cross(up, direction)
-            right /= np.linalg.norm(right)
-            true_up = np.cross(direction, right)
-
-            # Rotation matrix (camera-to-world)
-            R = np.stack([right, true_up, direction], axis=1)
-            rotations.append(R)
-    
-    return rotations
-
-
-def export_xmp_rig_files(output_dir: str, frame_name: str, pitch_angles: list, yaw_steps: int):
-    """
-    Export XMP rig files for a single frame's extracted views.
-    
     Args:
-        output_dir: Directory where the frame's view images are stored
-        frame_name: Base name of the frame (e.g., "frame_000001")
+        output_dir:   Directory where the frame's view images are stored
+        frame_name:   Base name of the frame (e.g., "frame_000001")
         pitch_angles: List of pitch angles used for extraction
-        yaw_steps: Number of yaw steps used for extraction
+        yaw_steps:    Number of yaw steps used for extraction
+        fov_deg:      The FOV the views were actually rendered at (must match
+                      panorama_processing.py's fov_deg so the focal length told to
+                      RealityScan matches the rendered frustum -- see
+                      focal_length_35mm_from_fov()).
+        horizon_ref:  If True, include a view_00 at pitch=0°, yaw=0° matching
+                      panorama_processing.py's horizon reference sensor.
+
+    Note: rig_id/pose_prior kwargs from the old call signature are accepted
+    and ignored (**_ignored) so existing call sites don't need to change.
     """
     output_path = Path(output_dir)
-    
-    # Generate unique IDs for this frame's rig
-    rig_id = str(uuid.uuid4()).upper()
-    rig_instance_id = str(uuid.uuid4()).upper()
-    
-    # Create rotation matrices matching your view extraction
-    rotations = create_rig_rotation_matrices(yaw_steps, pitch_angles)
-    
-    print(f"🎯 Generating XMP rig files for {frame_name} ({len(rotations)} views)")
-    
-    camera_index = 0
-    for pitch_idx, pitch in enumerate(pitch_angles):
+    focal_length_35mm = focal_length_35mm_from_fov(fov_deg)
+    xmp_content = generate_xmp_content(focal_length_35mm)
+
+    # Build view metadata list to match panorama_processing.py naming exactly
+    view_meta = []  # (view_index, pitch_deg, yaw_idx)
+    if horizon_ref:
+        view_meta.append((0, 0.0, 0))
+    for pitch in pitch_angles:
         for yaw_idx in range(yaw_steps):
-            # Get the rotation matrix for this camera
-            rotation_matrix = rotations[camera_index]
-            
-            # Camera position (at origin since it's relative to panorama center)
-            position = np.array([0.0, 0.0, 0.0])
-            
-            # Generate XMP content
-            xmp_content = generate_xmp_content(
-                position=position,
-                rotation_matrix=rotation_matrix,
-                rig_id=rig_id,
-                rig_instance_id=rig_instance_id,
-                rig_pose_index=camera_index,
-                pose_prior="exact"  # We know exact positions
-            )
-            
-            # Generate filename matching your existing naming convention
-            # This should match the format in panorama_processing.py
-            view_filename = f"{frame_name}_view_{camera_index:02d}_p{pitch:+03.0f}_y{yaw_idx:02d}.jpg"
-            xmp_filename = f"{view_filename}.xmp"
-            xmp_path = output_path / xmp_filename
-            
-            # Write XMP file
-            try:
-                with open(xmp_path, 'w', encoding='utf-8') as f:
-                    f.write(xmp_content)
-                print(f"   ✅ Created: {xmp_filename}")
-            except Exception as e:
-                print(f"   ❌ Failed to create {xmp_filename}: {e}")
-            
-            camera_index += 1
-    
-    print(f"✅ XMP rig export complete: {camera_index} files created")
+            view_meta.append((len(view_meta), pitch, yaw_idx))
+
+    print(f"Generating XMP calibration sidecars for {frame_name} ({len(view_meta)} views)")
+
+    for view_idx, pitch, yaw_idx in view_meta:
+        view_filename = f"{frame_name}_view_{view_idx:02d}_p{pitch:+03.0f}_y{yaw_idx:02d}.jpg"
+        xmp_path = output_path / f"{view_filename}.xmp"
+        try:
+            with open(xmp_path, 'w', encoding='utf-8') as f:
+                f.write(xmp_content)
+        except Exception as e:
+            print(f"   Failed to create {xmp_path.name}: {e}")
+
+    print(f"XMP export complete: {len(view_meta)} files created")
 
 
-def export_all_frame_rigs(views_dir: str, pitch_angles: list, yaw_steps: int):
+def export_all_frame_rigs(views_dir: str, pitch_angles: list, yaw_steps: int, fov_deg: float,
+                          horizon_ref: bool = False):
     """
-    Export XMP rig files for all frames in the views directory.
-    
+    Export XMP calibration sidecars for all frames in the views directory.
+
     Args:
-        views_dir: Root directory containing frame subdirectories
-        pitch_angles: List of pitch angles used for extraction  
-        yaw_steps: Number of yaw steps used for extraction
+        views_dir:    Root directory containing frame subdirectories
+        pitch_angles: List of pitch angles used for extraction
+        yaw_steps:    Number of yaw steps used for extraction
+        fov_deg:      The FOV the views were actually rendered at -- must match the
+                      fov_deg passed to panorama_processing.render_views() for this job.
+        horizon_ref:  If True, include the view_00 horizon reference sensor in each frame's XMP set
     """
     views_path = Path(views_dir)
-    
+
     if not views_path.exists():
-        print(f"❌ Views directory not found: {views_dir}")
+        print(f"Views directory not found: {views_dir}")
         return False
-    
-    # Find all frame subdirectories
-    frame_dirs = [d for d in views_path.iterdir() if d.is_dir()]
-    
+
+    frame_dirs = sorted(d for d in views_path.iterdir() if d.is_dir())
+
     if not frame_dirs:
-        print(f"❌ No frame directories found in: {views_dir}")
+        print(f"No frame directories found in: {views_dir}")
         return False
-    
-    print(f"🚀 Exporting XMP rigs for {len(frame_dirs)} frames...")
-    
+
+    print(f"Exporting XMP calibration sidecars for {len(frame_dirs)} frames...")
+
     success_count = 0
-    for frame_dir in sorted(frame_dirs):
-        frame_name = frame_dir.name
+    for frame_dir in frame_dirs:
         try:
-            export_xmp_rig_files(str(frame_dir), frame_name, pitch_angles, yaw_steps)
+            export_xmp_rig_files(str(frame_dir), frame_dir.name, pitch_angles, yaw_steps,
+                                 fov_deg=fov_deg, horizon_ref=horizon_ref)
             success_count += 1
         except Exception as e:
-            print(f"❌ Failed to export XMP for {frame_name}: {e}")
-    
-    print(f"✅ XMP export complete: {success_count}/{len(frame_dirs)} frames processed")
+            print(f"Failed to export XMP for {frame_dir.name}: {e}")
+
+    print(f"XMP export complete: {success_count}/{len(frame_dirs)} frames processed")
     return success_count > 0

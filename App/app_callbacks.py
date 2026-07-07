@@ -2432,23 +2432,19 @@ class CallbacksManager:
             # 🎯 DYNAMIC EXTRACTION PARAMETERS: Get from cached settings
             # Parse cached pitch angles and yaw steps from user's extraction settings
             pitch_angles_str = settings.get('pitch_angles_str', '-30.0')
-            yaw_steps_str = settings.get('yaw_steps', '6') 
-            #fov_str = settings.get('fov', '90.0')
-            
+            yaw_steps_str    = settings.get('yaw_steps', '6')
+            fov_str          = settings.get('fov', '90.0')
+
             try:
                 pitch_angles = [float(p.strip()) for p in pitch_angles_str.split(',')]
-                yaw_steps = int(yaw_steps_str)
-                # fov is not directly passed to run_full_pipeline, but used in panorama_processing
-                # For this pipeline, we'll assume the images were rendered with the correct FOV.
-                # If run_full_pipeline needs FOV, it should be passed.
-                # For now, it's not a direct parameter to run_full_pipeline.
-                # fov = float(fov_str) 
-                print(f"   🎯 DYNAMIC EXTRACTION PARAMS: pitch_angles={pitch_angles}, yaw_steps={yaw_steps}") # Removed FOV
+                yaw_steps    = int(yaw_steps_str)
+                fov          = float(fov_str)
+                print(f"   🎯 DYNAMIC EXTRACTION PARAMS: pitch_angles={pitch_angles}, yaw_steps={yaw_steps}, fov={fov}°")
             except (ValueError, AttributeError) as e:
                 print(f"   ⚠️ Failed to parse extraction params, using defaults: {e}")
-                pitch_angles = [0.0]  # Fallback
-                yaw_steps = 6  # Fallback
-                # fov = 90.0  # Fallback
+                pitch_angles = [0.0]
+                yaw_steps    = 6
+                fov          = 90.0
 
             # Run VGGT pipeline with GUI filter settings and configured path
 
@@ -2621,16 +2617,30 @@ class CallbacksManager:
                 
                 # Pass the full predictions_dict and use_anchor_rig flag
                 write_colmap_files(
-                    training_colmap_path, # Use the final COLMAP output directory
+                    training_colmap_path,
                     results['filtered_points'],
                     results['filtered_colors'],
-                    results['num_cameras_processed_poses_c2w'], # This should be the final camera poses array
-                    results['final_intrinsic'], # This should be the final intrinsic array
-                    results['expanded_image_names'], # This should be the expanded image names
+                    results['num_cameras_processed_poses_c2w'],
+                    results['final_intrinsic'],
+                    results['expanded_image_names'],
                     progress_callback=progress_callback,
-                    use_anchor_rig=use_anchor_rig_setting, # Pass the flag
-                    predictions_dict=results['raw_predictions'] # Pass the original raw predictions for rig info
+                    use_anchor_rig=use_anchor_rig_setting,
+                    predictions_dict=results['raw_predictions'],
                 )
+
+                # ── Triangulate from all rig images (anchor + siblings) ──────
+                # write_colmap_files only has depth-map points from the anchor view.
+                # All rig images are already flat-copied to training_colmap_path/images/
+                # by app_callbacks before run_full_pipeline is called, so the worker
+                # can triangulate directly without any additional image copying.
+                if use_anchor_rig_setting:
+                    from vggt_training import triangulate_rig_points
+                    sparse_dir = os.path.join(training_colmap_path, "sparse")
+                    print(f"   🔺 Triangulating 3D points from all rig cameras…")
+                    triangulate_rig_points(
+                        sparse_dir=sparse_dir,
+                        progress_callback=progress_callback,
+                    )
 
             if not results.get('success', False):
                 error_msg = results.get('error', 'Unknown error')

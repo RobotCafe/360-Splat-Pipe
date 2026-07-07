@@ -1638,18 +1638,70 @@ def create_simple_glb_viewer(glb_path, html_path, title):
 # COLMAP EXPORT (Simplified and corrected)
 # =================================================================================
 
+def collect_all_rig_images(
+    anchor_paths: List[str],
+    yaw_steps: int,
+    pitch_angles: List[float],
+) -> List[str]:
+    """
+    Given the anchor image paths (one per frame), return paths for ALL rig images
+    (anchor + all sibling sensors) by scanning the same frame directories.
+
+    Anchor images live at:
+        <image_dir>/frame_XXXXXX/frame_XXXXXX_view_00_p-30_y00.jpg
+
+    Sibling images live alongside them:
+        <image_dir>/frame_XXXXXX/frame_XXXXXX_view_01_p-30_y01.jpg  ...etc.
+
+    The returned list preserves the same ordering that expand_anchor_to_rig uses
+    (all views for frame 0, then all views for frame 1, ...) so indices line up
+    with camera poses.
+    """
+    all_paths: List[str] = []
+    image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
+
+    for anchor_path in anchor_paths:
+        anchor_p = Path(anchor_path)
+        frame_dir = anchor_p.parent
+
+        # Collect every image in this frame directory, sorted so the order is stable
+        frame_images = []
+        for ext in image_extensions:
+            frame_images.extend(frame_dir.glob(f"*{ext}"))
+            frame_images.extend(frame_dir.glob(f"*{ext.upper()}"))
+        frame_images = sorted(set(frame_images))
+
+        if not frame_images:
+            # Fallback: at minimum keep the anchor itself
+            frame_images = [anchor_p]
+
+        # We want the views in the same order expand_anchor_to_rig generates poses.
+        # That order is: view_00, view_01, view_02, ... view_N
+        # Sort by the view index embedded in the filename.
+        def _view_idx(p: Path) -> int:
+            import re
+            m = re.search(r'_view_(\d+)_', p.name)
+            return int(m.group(1)) if m else 0
+
+        frame_images.sort(key=_view_idx)
+        all_paths.extend(str(p) for p in frame_images)
+
+    return all_paths
+
+
 def write_colmap_files(
-    output_dir: str, 
-    filtered_points: np.ndarray, 
-    filtered_colors: np.ndarray, 
+    output_dir: str,
+    filtered_points: np.ndarray,
+    filtered_colors: np.ndarray,
     camera_poses_c2w: np.ndarray, # Expects C2W 3x4 or 4x4 matrices
-    camera_intrinsics: np.ndarray, 
-    image_names: List[str], 
+    camera_intrinsics: np.ndarray,
+    image_names: List[str],
     progress_callback: Optional[Callable] = None,
     colmap_image_width: int = 1920, # Desired output image dimensions for COLMAP
-    colmap_image_height: int = 1920, # This should match actual image files COLMAP uses 
+    colmap_image_height: int = 1920, # This should match actual image files COLMAP uses
     use_anchor_rig: bool = False, # NEW: Flag for anchor+rig mode
-    predictions_dict: Optional[Dict] = None # NEW: Pass full predictions for rig info
+    predictions_dict: Optional[Dict] = None, # NEW: Pass full predictions for rig info
+    fov: Optional[float] = None, # Known extraction FOV in degrees — overrides VGGT intrinsic estimate
 ) -> Tuple[Optional[str], int]:
     """
     Writes COLMAP text format files (cameras.txt, images.txt, points3D.txt) using a
@@ -1708,13 +1760,28 @@ def write_colmap_files(
         f.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
         f.write(f"# Number of cameras: {len(camera_poses_c2w)}\n")
         vggt_base_res = 518
-        
+
+        # Use known extraction FOV when available — this is more accurate than
+        # VGGT's internal estimate, which is computed at 518px and may drift from
+        # the true virtual camera FOV used in panorama_processing.py.
+        # Fall back to VGGT's estimate only when FOV is unknown.
+        if fov is not None:
+            known_focal = colmap_image_width / (2.0 * np.tan(np.radians(fov) / 2.0))
+            if progress_callback:
+                progress_callback(f"   📐 Using known extraction FOV {fov}° → focal={known_focal:.2f}px")
+        else:
+            known_focal = None
+            if progress_callback:
+                progress_callback("   ⚠️  FOV not supplied — using VGGT intrinsic estimates (less accurate for triangulation)")
+
         for cam_idx in range(len(camera_poses_c2w)):
-            vggt_fx = camera_intrinsics[cam_idx, 0, 0]
-            vggt_fy = camera_intrinsics[cam_idx, 1, 1]
-            resize_ratio = colmap_image_width / vggt_base_res
-            fx = vggt_fx * resize_ratio
-            fy = vggt_fy * resize_ratio
+            if known_focal is not None:
+                fx = known_focal
+                fy = known_focal
+            else:
+                resize_ratio = colmap_image_width / vggt_base_res
+                fx = camera_intrinsics[cam_idx, 0, 0] * resize_ratio
+                fy = camera_intrinsics[cam_idx, 1, 1] * resize_ratio
             cx = colmap_image_width / 2.0
             cy = colmap_image_height / 2.0
             f.write(f"{cam_idx + 1} PINHOLE {colmap_image_width} {colmap_image_height} {fx:.6f} {fy:.6f} {cx:.6f} {cy:.6f}\n")
@@ -2105,6 +2172,113 @@ def optimize_points_for_rig_coverage(points, colors, confidences, predictions, u
         return points, colors, confidences
 
 # =================================================================================
+# RIG TRIANGULATION (fills sibling-view point cloud gap)
+# =================================================================================
+
+# Python 3.14 executable that carries pycolmap 4.0.4 (same as colmap_runner)
+_PYTHON_314      = "C:\\Python314\\python.exe"
+_TRIANGULATE_WORKER = str(Path(__file__).parent / "triangulate_worker.py")
+
+
+def triangulate_rig_points(
+    sparse_dir: str,
+    progress_callback: Optional[Callable] = None,
+) -> bool:
+    """
+    Triangulate 3D points from all rig images using fixed camera poses.
+
+    Expects the standard VGGT output layout:
+        sparse_dir/              cameras.txt, images.txt, points3D.txt
+        sparse_dir/../images/    all rig images flat (copied by app_callbacks)
+
+    Uses a Python 3.14 / pycolmap 4.0.4 subprocess (same pattern as
+    colmap_worker.py) because pycolmap 3.12.4 on Python 3.13 has broken
+    feature-extraction bindings.
+
+    Replaces points3D.txt with a triangulated cloud covering all sensor FOVs,
+    not just the anchor depth map.
+
+    Args:
+        sparse_dir:        Path to the sparse/ directory (with cameras.txt etc.)
+        progress_callback: Optional progress function
+    """
+    if progress_callback:
+        progress_callback("🔺 Triangulating 3D points from all rig cameras (replacing depth-only cloud)…")
+
+    payload = {
+        "sparse_dir": str(sparse_dir),
+    }
+
+    import subprocess, queue, threading
+
+    process = subprocess.Popen(
+        [_PYTHON_314, "-P", _TRIANGULATE_WORKER, json.dumps(payload)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    _stderr_q: queue.SimpleQueue = queue.SimpleQueue()
+
+    def _pipe_stderr():
+        for raw in process.stderr:
+            line = raw.decode("utf-8", errors="replace").rstrip()
+            if line:
+                _stderr_q.put(line)
+
+    _stderr_thread = threading.Thread(target=_pipe_stderr, daemon=True)
+    _stderr_thread.start()
+
+    worker_lines = []
+    while True:
+        raw = process.stdout.readline()
+        if not raw and process.poll() is not None:
+            break
+        if not raw:
+            continue
+        line = raw.decode("utf-8", errors="replace").strip()
+        if line.startswith("WORKER_PROGRESS:"):
+            parts = line.split(":", 2)
+            try:
+                pct = int(parts[1])
+                msg = parts[2] if len(parts) > 2 else ""
+            except (ValueError, IndexError):
+                pct, msg = 0, line
+            if progress_callback:
+                progress_callback(f"   [triangulate] {pct}% — {msg}")
+        elif line:
+            worker_lines.append(line)
+
+    _stderr_thread.join(timeout=2)
+    process.wait()
+
+    if process.returncode != 0:
+        stderr_lines = []
+        while not _stderr_q.empty():
+            stderr_lines.append(_stderr_q.get_nowait())
+        worker_error = ""
+        if worker_lines:
+            try:
+                err = json.loads(worker_lines[-1])
+                worker_error = err.get("error", "") + "\n" + err.get("traceback", "")
+            except Exception:
+                worker_error = "\n".join(worker_lines[-5:])
+        if progress_callback:
+            progress_callback(f"❌ Triangulation worker failed:\n{worker_error or chr(10).join(stderr_lines)}")
+        return False
+
+    try:
+        result = json.loads(worker_lines[-1])
+        n_pts = result.get("points3D", 0)
+        if progress_callback:
+            progress_callback(f"✅ Triangulation complete — {n_pts:,} 3D points covering all rig sensors")
+        return result.get("success", False)
+    except Exception:
+        if progress_callback:
+            progress_callback("⚠️ Triangulation worker returned unexpected output — check server log")
+        return False
+
+
+# =================================================================================
 # MAIN PIPELINE ORCHESTRATION
 # =================================================================================
 
@@ -2472,6 +2646,9 @@ def run_full_pipeline(
             "final_intrinsic": final_intrinsic,
             "expanded_image_names": expanded_image_names,
             "raw_predictions": raw_predictions,
+            # Triangulation support
+            "anchor_image_paths": image_paths,   # anchor-only paths VGGT ran on
+            "image_dir": image_dir,              # source 02_views/ directory
         }
         
     except Exception as e:
